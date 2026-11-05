@@ -39,7 +39,7 @@ jobs:
       # Bản :free bị OpenRouter gỡ ngày 30/11/2026 -> sau ngày đó đổi thành "heygen/heygen-voice-1-turbo" (trả phí, cần nạp credit)
       TTS_MODEL: "heygen/heygen-voice-1-turbo:free"
       # Giọng: nadine, tabitha, bram, gareth, noelle, meredith, sabrina, lucian, weston, vincent
-      TTS_VOICE: "nadine"
+      TTS_VOICE: "sabrina"
       TTS_PCM_RATE: "44100"       # Tần số mẫu PCM của HeyGen. Nghe giọng nhanh/chậm/méo thì thử 24000 hoặc 22050
       SEND_TEXT_ALSO: "0"         # "1" = gửi thêm bản chữ ngay sau mỗi tin voice
       # STATE_FILE: "state_voice.json"   # Bỏ comment nếu muốn bản voice có bộ nhớ riêng, không dùng chung với bot cũ
