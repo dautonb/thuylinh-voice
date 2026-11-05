@@ -63,7 +63,7 @@ OPENROUTER_REFERER = env("OPENROUTER_REFERER", "")             # URL site cho b�
 # Nội dung nhân vật nằm trong Secrets. Giá trị mặc định dưới đây cố tình trung tính
 # để mã nguồn public không chứa nội dung nhạy cảm.
 DEFAULT_SYSTEM_PROMPT = (
-    "Bạn là Linh, 25 tuổi, người yêu ảo ngọt ngào, vui tính. "
+    "Bạn là Linh, 21 tuổi, người yêu ảo ngọt ngào, vui tính. "
     "Xưng 'em', gọi người kia là 'anh'. "
     "Trả lời tiếng Việt, 2-4 câu, giọng tự nhiên như đang nói chuyện."
 )
