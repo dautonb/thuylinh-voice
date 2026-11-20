@@ -1,10 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bot.py - Linh Voice Bot chạy trên GitHub Actions (Long Polling).
-
-Bản VOICE: DeepSeek viết câu trả lời -> HeyGen Voice Turbo (qua OpenRouter) đọc thành giọng nói
--> đổi PCM sang ogg/opus bằng ffmpeg -> gửi vào Telegram bằng sendVoice.
-TTS hoặc gửi voice lỗi thì tự gửi chữ, bot không bao giờ im lặng.
+bot.py - Linh Bot (chat DeepSeek + voice + ảnh qua OpenRouter) chạy trên GitHub Actions (Long Polling).
 
 Khác bản chạy trên laptop:
 - Mọi khóa bí mật và nội dung nhân vật đọc từ GitHub Secrets (repo public không lộ gì).
@@ -19,14 +15,13 @@ import base64
 import json
 import logging
 import os
+import queue
 import random
 import re
-import shutil
 import signal
-import subprocess
 import sys
+import threading
 import time
-import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
@@ -44,45 +39,24 @@ def env(name, default=""):
 TELEGRAM_BOT_TOKEN = env("TELEGRAM_BOT_TOKEN")
 CHAT_ID = env("CHAT_ID")
 DEEPSEEK_API_KEY = env("DEEPSEEK_API_KEY")
-OPENROUTER_API_KEY = env("OPENROUTER_API_KEY")  # Khóa OpenRouter để gọi HeyGen Voice Turbo (TTS)
 STATE_REPO = env("STATE_REPO")                  # Dạng "ten-github/linh-bot-data" (repo RIÊNG TƯ)
 STATE_REPO_TOKEN = env("STATE_REPO_TOKEN")      # Token quyền Contents: Read and write cho repo đó
 
 RUN_SECONDS = int(env("RUN_SECONDS", "20400"))  # Thời gian chạy mỗi lượt (5h40m < giới hạn 6h)
 TZ_OFFSET_HOURS = float(env("TZ_OFFSET_HOURS", "7"))  # Múi giờ để tính giờ yên lặng (VN = +7)
 
-# --- Giọng nói (TTS) ---
-# Bản ":free" sẽ bị OpenRouter gỡ ngày 30/11/2026 -> sau đó đổi TTS_MODEL thành "heygen/heygen-voice-1-turbo" (trả phí).
-TTS_MODEL = env("TTS_MODEL", "heygen/heygen-voice-1-turbo:free")
-# 10 giọng có sẵn: nadine, tabitha, bram, gareth, noelle, meredith, sabrina, lucian, weston, vincent
-TTS_VOICE = env("TTS_VOICE", "sabrina")
-SEND_TEXT_ALSO = env("SEND_TEXT_ALSO", "0") == "1"   # "1" = gửi thêm bản chữ ngay sau voice
-OPENROUTER_TITLE = env("OPENROUTER_TITLE", "Linh Voice Bot")   # Tên hiển thị trên openrouter.ai (tùy chọn)
-OPENROUTER_REFERER = env("OPENROUTER_REFERER", "")             # URL site cho bảng xếp hạng (tùy chọn, có thể để trống)
-
 # Nội dung nhân vật nằm trong Secrets. Giá trị mặc định dưới đây cố tình trung tính
 # để mã nguồn public không chứa nội dung nhạy cảm.
 DEFAULT_SYSTEM_PROMPT = (
-    "Bạn là Linh, 21 tuổi, người yêu ảo ngọt ngào, vui tính. "
-    "Xưng 'em', gọi người kia là 'anh'. "
-    "Trả lời tiếng Việt, 2-4 câu, giọng tự nhiên như đang nói chuyện."
-)
-# Gắn thêm vào SYSTEM_PROMPT (kể cả khi bạn dùng prompt riêng trong Secrets) để câu trả lời hợp để ĐỌC THÀNH TIẾNG.
-# Muốn tắt: đặt secret VOICE_PROMPT_SUFFIX = "-" ; muốn thay: đặt nội dung riêng.
-DEFAULT_VOICE_SUFFIX = (
-    "[Lưu ý giọng nói: lời của em sẽ được chuyển thành giọng nói gửi cho anh. "
-    "Hãy nói tự nhiên như đang trò chuyện, câu ngắn gọn dễ đọc thành tiếng, ưu tiên 2-4 câu. "
-    "Không dùng emoji, không dùng định dạng markdown; viết số và từ viết tắt thành dạng dễ đọc. "
-    "Cử chỉ đặt trong dấu * sẽ KHÔNG được đọc ra, nên lời nói phải tự đủ ý.]"
+    "Bạn là Linh, 25 tuổi, người yêu ảo ngọt ngào, vui tính. "
+    "Xưng 'em', gọi người kia là 'anh'. Dùng các cử chỉ đặt trong dấu *. "
+    "Trả lời tiếng Việt, 3-5 câu, dùng emoji vừa phải."
 )
 DEFAULT_PROACTIVE_INSTRUCTION = (
     "[Tình huống: đã khoảng {hours} giờ anh không nhắn tin cho em. "
     "Hãy nhắn trước một tin ngắn, ngọt ngào, nói em nhớ anh.]"
 )
-_voice_suffix = env("VOICE_PROMPT_SUFFIX", DEFAULT_VOICE_SUFFIX)
 SYSTEM_PROMPT = env("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
-if _voice_suffix and _voice_suffix != "-":
-    SYSTEM_PROMPT = SYSTEM_PROMPT + "\n\n" + _voice_suffix
 STYLE_REMINDER = env("STYLE_REMINDER", "")      # Lời nhắc gắn vào cuối mỗi tin của chủ nhân (có thể để trống)
 PROACTIVE_INSTRUCTION = env("PROACTIVE_INSTRUCTION", DEFAULT_PROACTIVE_INSTRUCTION)
 
@@ -90,36 +64,47 @@ PROACTIVE_INSTRUCTION = env("PROACTIVE_INSTRUCTION", DEFAULT_PROACTIVE_INSTRUCTI
 # HẰNG SỐ HỆ THỐNG
 # ============================================================
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
-# Id đúng của DeepSeek V4 là "deepseek-v4-flash" (bản cũ ghi "deepseek-flash" sẽ báo Model Not Exist).
-# Hai tên cũ "deepseek-chat"/"deepseek-reasoner" đã ngừng từ 24/07/2026.
-DEEPSEEK_MODEL = env("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_MODEL = env("DEEPSEEK_MODEL", "deepseek-flash")   # "deepseek-chat" đã bị ngừng từ 24/07/2026
 GH_API = "https://api.github.com"
-# Tên file lưu bộ nhớ trong repo riêng tư. Giữ "state.json" = dùng tiếp bộ nhớ của bot cũ;
-# đặt tên khác (vd state_voice.json) nếu muốn bản voice có bộ nhớ riêng.
-STATE_FILE = env("STATE_FILE", "state.json")
-
-TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
-TTS_MAX_CHARS = 4800         # HeyGen Voice cho tối đa 5.000 ký tự mỗi lần gọi
-TTS_ATTEMPTS = 2             # Số lần thử gọi TTS trước khi chuyển sang gửi chữ
-TTS_RETRY_DELAY = 3          # Giây chờ giữa 2 lần thử
-# HeyGen Voice CHỈ hỗ trợ response_format "pcm": 16-bit little-endian, mono, theo trang model là 44,1 kHz.
-# Nếu nghe giọng nhanh/chậm/méo thì đổi biến TTS_PCM_RATE (thử 24000, 22050...). Header Content-Type có "rate=" thì ưu tiên theo header.
-PCM_SAMPLE_RATE = int(env("TTS_PCM_RATE", "44100"))
+STATE_FILE = env("STATE_FILE", "state.json")   # Tên file lưu bộ nhớ; 2 bot dùng chung repo dữ liệu thì mỗi bot một tên
 
 MEMORY_WINDOW = 14           # Số tin gần nhất gửi kèm làm ngữ cảnh mỗi lần gọi API
-MAX_STORED_MESSAGES = 90000     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
+MAX_STORED_MESSAGES = 60     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
 POLL_TIMEOUT = 20            # Long Polling: Telegram giữ kết nối tối đa 20s nếu chưa có tin mới
 RETRY_DELAY = 5              # Giây chờ khi lỗi mạng / lỗi API trước khi thử lại
 MAX_RETRY_PER_UPDATE = 3     # Một tin nhắn lỗi tối đa 3 lần thì bỏ qua
 
 # --- Tính năng Linh chủ động nhắn trước khi chủ nhân im lặng ---
 PROACTIVE_ENABLED = True
-PROACTIVE_MIN_IDLE = 1 * 2400
-PROACTIVE_MAX_IDLE = 2 * 3600
-MAX_UNANSWERED_PROACTIVE = 20000     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
+PROACTIVE_MIN_IDLE = 2 * 3600
+PROACTIVE_MAX_IDLE = 3 * 3600
+MAX_UNANSWERED_PROACTIVE = 2     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
 QUIET_START_HOUR = 0             # Không nhắn trước từ 0h...
 QUIET_END_HOUR = 7               # ...đến 7h sáng (theo TZ_OFFSET_HOURS)
 PROACTIVE_RETRY_DELAY = 60
+
+# --- Voice + ảnh qua OpenRouter (tùy chọn: thiếu OPENROUTER_API_KEY thì bot chỉ nhắn chữ) ---
+def env_int(name, default):
+    """Đọc số nguyên từ biến môi trường; sai định dạng thì dùng mặc định."""
+    try:
+        return int(env(name, str(default)))
+    except ValueError:
+        return default
+
+
+OPENROUTER_API_KEY = env("OPENROUTER_API_KEY")
+IMAGE_URL = "https://openrouter.ai/api/v1/images"
+TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+IMAGE_MODEL = env("IMAGE_MODEL", "recraft/recraft-v4.1-flash-v2:free")
+TTS_MODEL = env("TTS_MODEL", "heygen/heygen-voice-1-turbo:free")   # Bản free ngừng ngày 30/11/2026
+TTS_VOICE = env("TTS_VOICE", "nadine")
+IMAGE_ENABLED = env("IMAGE_ENABLED", "1") != "0"
+VOICE_ENABLED = env("VOICE_ENABLED", "1") != "0"
+VOICE_EVERY_N = max(1, env_int("VOICE_EVERY_N", 1))    # Cứ N tin trả lời thì kèm 1 voice
+IMAGE_EVERY_N = max(0, env_int("IMAGE_EVERY_N", 6))    # Cứ N tin trả lời tự gửi 1 ảnh (0 = chỉ gửi khi được xin)
+MAX_SPEECH_CHARS = 600                                 # Giới hạn độ dài lời nói mỗi voice (tiết kiệm, nói nhanh)
+MEDIA_PAUSE_RATE_LIMIT = 30 * 60                       # Bị giới hạn lượt gọi (429): tạm dừng loại media đó 30 phút
+MEDIA_PAUSE_CONFIG_ERROR = 6 * 3600                    # Lỗi khóa/credit/tên model (401-404): tạm dừng 6 giờ
 
 
 # ============================================================
@@ -130,7 +115,7 @@ class RedactFormatter(logging.Formatter):
 
     def format(self, record):
         text = super().format(record)
-        for secret in (TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, STATE_REPO_TOKEN):
+        for secret in (TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, STATE_REPO_TOKEN, OPENROUTER_API_KEY):
             if secret:
                 text = text.replace(secret, "***")
         return text
@@ -156,6 +141,7 @@ store = {
     "last_user": 0.0,    # Lần cuối chủ nhân nhắn
     "last_event": 0.0,   # Lần cuối có tương tác (chủ nhân nhắn HOẶC Linh nhắn trước)
     "unanswered": 0,     # Số tin nhắn trước liên tiếp chưa được trả lời
+    "voice_on": True,    # Bật/tắt tin nhắn thoại (lệnh /voice)
 }
 remote = {"sha": None, "dirty": False}  # sha của file trên repo; dirty = có thay đổi chưa lưu được
 
@@ -237,6 +223,8 @@ def load_store():
             store[key] = cast(data.get(key, store[key]))
         except (TypeError, ValueError):
             pass
+    if isinstance(data.get("voice_on"), bool):
+        store["voice_on"] = data["voice_on"]
 
 
 def load_history():
@@ -297,35 +285,12 @@ def send_message(chat_id, text):
     tg_call("sendMessage", {"chat_id": chat_id, "text": text[:4000]})
 
 
-def send_voice(chat_id, audio, kind):
-    """
-    Gửi tin nhắn thoại (hiện dạng bong bóng voice có sóng âm). sendVoice nhận ogg/opus (đường chính của bot) hoặc mp3.
-    File được upload dạng multipart nên không dùng tg_call (chỉ gửi JSON).
-    """
-    mime, ext = ("audio/mpeg", "mp3") if kind == "mp3" else ("audio/ogg", "ogg")
-    url = "https://api.telegram.org/bot{}/sendVoice".format(TELEGRAM_BOT_TOKEN)
-    resp = session.post(
-        url,
-        data={"chat_id": chat_id},
-        files={"voice": ("linh.{}".format(ext), audio, mime)},
-        timeout=(5, 60),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if not data.get("ok"):
-        raise RuntimeError("Telegram từ chối sendVoice: {}".format(data))
-
-
-def send_action(chat_id, action):
-    """Hiện trạng thái 'đang nhập...' / 'đang ghi âm...'. Lỗi ở đây không quan trọng nên bỏ qua."""
+def send_typing(chat_id):
+    """Hiện trạng thái 'đang nhập...'. Lỗi ở đây không quan trọng nên bỏ qua."""
     try:
-        tg_call("sendChatAction", {"chat_id": chat_id, "action": action}, timeout=5)
+        tg_call("sendChatAction", {"chat_id": chat_id, "action": "typing"}, timeout=5)
     except Exception:
         pass
-
-
-def send_typing(chat_id):
-    send_action(chat_id, "typing")
 
 
 # ============================================================
@@ -334,7 +299,7 @@ def send_typing(chat_id):
 # Các mẫu nhận diện câu trả lời "vô nghĩa" do model sinh lỗi
 CJK_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")  # chữ Trung/Nhật/Hàn
 REPEAT_CHAR_PATTERN = re.compile(r"(.)\1{14,}")   # 1 ký tự lặp liên tiếp từ 15 lần
-LEAK_MARKERS = ("[Nhắc Linh", "[Tình huống", "[BỐI CẢNH", "[Lưu ý giọng nói")   # model lỡ đọc lại chỉ dẫn nội bộ
+LEAK_MARKERS = ("[Nhắc Linh", "[Tình huống", "[BỐI CẢNH")      # model lỡ đọc lại chỉ dẫn nội bộ
 VI_CHARS = set("àáạảãâầấậẩẫăằắặẳẵèéẹẻẽêềếệểễìíịỉĩòóọỏõôồốộổỗơờớợởỡùúụủũưừứựửữỳýỵỷỹđ")
 
 
@@ -468,168 +433,6 @@ def generate_proactive(history, idle_hours):
 
 
 # ============================================================
-# GIỌNG NÓI: HeyGen Voice Turbo qua OpenRouter -> Telegram sendVoice
-# ============================================================
-GESTURE_PATTERN = re.compile(r"\*[^*]*\*")   # *cử chỉ* - không đọc thành tiếng
-EMOJI_PATTERN = re.compile(
-    "[\U0001F000-\U0001FAFF\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200d\u20e3]+"
-)
-# Gợi ý dễ hiểu cho các mã lỗi thường gặp (hiện trong log Actions để bạn biết sửa gì)
-TTS_HINTS = {
-    400: "tham số bị từ chối - xem thông báo ngay trước (vd voice không có trong 10 giọng, hoặc response_format khác pcm)",
-    401: "sai hoặc thiếu OPENROUTER_API_KEY",
-    402: "OpenRouter hết credit (model trả phí cần nạp tiền)",
-    404: "model/voice không tồn tại - nếu đã qua 30/11/2026 thì bản :free đã bị gỡ, hãy đổi TTS_MODEL",
-    429: "chạm giới hạn tốc độ của OpenRouter (bản free dễ bị)",
-}
-
-
-def clean_for_speech(text):
-    """
-    Làm sạch chữ trước khi đọc: bỏ *cử chỉ*, emoji, ký hiệu markdown. Trả về "" nếu không còn gì để đọc.
-    Lịch sử trò chuyện vẫn lưu bản gốc (còn cử chỉ) nên văn phong của Linh không bị mất.
-    """
-    text = unicodedata.normalize("NFC", text)   # Gộp dấu tiếng Việt về dạng chuẩn
-    text = GESTURE_PATTERN.sub(" ", text)
-    text = text.replace("*", " ")                # Dấu * lẻ còn sót
-    text = EMOJI_PATTERN.sub(" ", text)
-    text = re.sub(r"[_`#>~]+", " ", text)        # Ký hiệu markdown và dấu ~ (vd "anh yêu~")
-    text = re.sub(r"\s+", " ", text).strip()
-    if not re.search(r"\w", text):
-        return ""
-    return text[:TTS_MAX_CHARS]
-
-
-def detect_audio(data):
-    """
-    Phòng khi sau này API trả sẵn mp3/ogg: nhận ra qua dấu hiệu đầu file ('ID3' hoặc 'OggS').
-    Ngoài ra coi là PCM thô (đường chính hiện nay của HeyGen).
-    """
-    if data[:3] == b"ID3":
-        return "mp3"
-    if data[:4] == b"OggS":
-        return "ogg"
-    return None
-
-
-def pcm_to_ogg(pcm, rate):
-    """
-    Đổi PCM thô (16-bit little-endian, mono) sang ogg/opus bằng ffmpeg - định dạng Telegram phát được
-    dưới dạng tin nhắn thoại. ffmpeg là BẮT BUỘC (workflow đã có bước cài).
-    """
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("máy không có ffmpeg để đổi PCM sang ogg/opus")
-    if len(pcm) % 2:
-        pcm = pcm[:-1]   # PCM 16-bit phải chẵn byte
-    proc = subprocess.run(
-        ["ffmpeg", "-loglevel", "error", "-f", "s16le", "-ar", str(rate), "-ac", "1",
-         "-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k", "-application", "voip",
-         "-ar", "48000", "-f", "ogg", "pipe:1"],
-        input=pcm, capture_output=True, timeout=60,
-    )
-    if proc.returncode != 0 or not proc.stdout:
-        raise RuntimeError("ffmpeg lỗi: {}".format(proc.stderr.decode("utf-8", "ignore")[:150]))
-    return proc.stdout
-
-
-def check_tts_response(resp):
-    """Nếu OpenRouter trả lỗi HTTP thì ghi rõ lý do + gợi ý cách sửa (không ghi nội dung chat) rồi ném lỗi."""
-    if resp.status_code < 400:
-        return
-    reason = ""
-    try:
-        data = resp.json()
-        if isinstance(data, dict):
-            error = data.get("error")
-            reason = (error.get("message") if isinstance(error, dict) else error) or data.get("message") or ""
-    except ValueError:
-        pass
-    logging.error(
-        "OpenRouter TTS HTTP %s: %s%s",
-        resp.status_code,
-        str(reason)[:150],
-        " -> " + TTS_HINTS[resp.status_code] if resp.status_code in TTS_HINTS else "",
-    )
-    resp.raise_for_status()
-
-
-def synthesize(text):
-    """Gọi HeyGen Voice Turbo qua OpenRouter (PCM) rồi đổi sang ogg/opus. Trả về (bytes âm thanh, 'ogg')."""
-    headers = {
-        "Authorization": "Bearer {}".format(OPENROUTER_API_KEY),
-        "Content-Type": "application/json",
-        "X-OpenRouter-Title": OPENROUTER_TITLE,
-    }
-    if OPENROUTER_REFERER:
-        headers["HTTP-Referer"] = OPENROUTER_REFERER
-
-    payload = {
-        "model": TTS_MODEL,
-        "input": text,
-        "voice": TTS_VOICE,
-        # HeyGen Voice chỉ hỗ trợ "pcm" (gửi "mp3" sẽ bị lỗi 400: only supports response_format "pcm")
-        "response_format": "pcm",
-    }
-    resp = session.post(TTS_URL, headers=headers, json=payload, timeout=(5, 60))
-    check_tts_response(resp)
-
-    if "json" in resp.headers.get("Content-Type", "").lower():
-        raise ValueError("OpenRouter trả JSON thay vì âm thanh")
-    audio = resp.content
-    if len(audio) < 1000:
-        raise ValueError("Âm thanh rỗng hoặc quá ngắn ({} byte)".format(len(audio)))
-
-    kind = detect_audio(audio)
-    if kind:                      # Đã là mp3/ogg sẵn -> gửi thẳng
-        return audio, kind
-
-    rate = PCM_SAMPLE_RATE
-    match = re.search(r"rate=(\d{4,6})", resp.headers.get("Content-Type", ""))
-    if match:                     # Header nói rõ tần số mẫu thì tin header
-        rate = int(match.group(1))
-    return pcm_to_ogg(audio, rate), "ogg"
-
-
-def text_to_voice(text):
-    """synthesize() có thử lại. Hết lượt thử vẫn lỗi thì ném lỗi cuối cùng."""
-    last_error = None
-    for attempt in range(TTS_ATTEMPTS):
-        try:
-            return synthesize(text)
-        except Exception as e:
-            last_error = e
-            logging.warning("TTS lỗi lần %s/%s: %s", attempt + 1, TTS_ATTEMPTS, e)
-            if attempt + 1 < TTS_ATTEMPTS:
-                time.sleep(TTS_RETRY_DELAY)
-    raise last_error
-
-
-def deliver(chat_id, text):
-    """
-    Gửi câu trả lời của Linh dưới dạng VOICE. Bất cứ bước nào của voice (TTS, tải lên Telegram) lỗi
-    thì tự gửi bản chữ để bot không bao giờ im lặng. Chỉ khi cả bản chữ cũng lỗi mới ném exception
-    (để vòng lặp chính thử lại tin này).
-    """
-    spoken = clean_for_speech(text)
-    if spoken:
-        try:
-            send_action(chat_id, "record_voice")
-            audio, kind = text_to_voice(spoken)
-            send_voice(chat_id, audio, kind)
-        except Exception as e:
-            logging.error("Không gửi được voice (%s) -> gửi bản chữ thay thế", e)
-        else:
-            if SEND_TEXT_ALSO:
-                try:
-                    send_message(chat_id, text)
-                except Exception as e:
-                    # Voice đã tới nơi; ném lỗi ở đây sẽ làm gửi lại voice lần nữa nên chỉ ghi log
-                    logging.error("Không gửi được bản chữ kèm theo: %s", e)
-            return
-    send_message(chat_id, text)
-
-
-# ============================================================
 # NHẮN TRƯỚC CHỦ ĐỘNG (khi chủ nhân im lặng quá lâu)
 # ============================================================
 timer = {"next_at": 0.0}   # Thời điểm sớm nhất Linh được phép nhắn trước
@@ -684,7 +487,7 @@ def maybe_send_proactive():
     try:
         history = load_history()
         text = generate_proactive(history, idle_hours)
-        deliver(CHAT_ID, text)
+        send_message(CHAT_ID, text)
 
         # Chỉ lưu tin của Linh (không lưu chỉ dẫn nội bộ)
         history.append({"role": "assistant", "content": text})
@@ -693,10 +496,259 @@ def maybe_send_proactive():
         schedule_next(now)
         save_history(history)
         logging.info("Đã nhắn trước (chưa trả lời: %s)", store["unanswered"])
+        enqueue_media(CHAT_ID, text, None)   # Kèm voice/ảnh theo cấu hình (không bao giờ ném lỗi)
     except Exception as e:
         # Lỗi mạng / API: thử lại sau 1 phút, không làm sập vòng lặp
         logging.error("Lỗi khi nhắn trước: %s", e)
         timer["next_at"] = time.time() + PROACTIVE_RETRY_DELAY
+
+
+# ============================================================
+# VOICE + ẢNH (chạy ở luồng nền để không làm chậm việc nhận tin)
+# ============================================================
+# Ảnh luôn là chân dung SFW của một phụ nữ trưởng thành, mặc đồ kín đáo, nằm trên giường
+# (Recraft từ chối nội dung NSFW nên prompt giữ trong giới hạn đó).
+IMAGE_PROMPT = (
+    "Photorealistic photo of a beautiful adult Vietnamese woman, 25 years old, long dark hair, "
+    "natural makeup, gentle smile, lying on a bed, {pose}, wearing {outfit}, {setting}, {mood}. "
+    "Tasteful and elegant, fully clothed, soft cinematic lighting, shallow depth of field, high detail."
+)
+IMAGE_POSES = [
+    "lying on her side with her head resting on her hand, looking at the camera",
+    "lying on her back with her hair spread across the pillow, looking up at the camera",
+    "lying on her stomach with her chin propped on her folded arms, smiling at the camera",
+    "lying on the bed hugging a soft pillow, looking at the camera with a sweet smile",
+    "lying on her side holding a phone, glancing playfully at the camera",
+]
+IMAGE_OUTFITS = [
+    "a cozy oversized white knit sweater and long sleep pants",
+    "a satin pajama set with long sleeves and long pants",
+    "a soft pastel hoodie and cotton lounge pants",
+    "a cream-colored cardigan over a simple t-shirt and long pants",
+]
+IMAGE_SETTINGS = [
+    "white linen bedsheets in a bright bedroom with morning light through sheer curtains",
+    "a cozy bedroom lit by a warm bedside lamp in the evening",
+    "a bedroom decorated with warm fairy lights at night",
+    "a minimalist bedroom with soft golden-hour sunlight",
+]
+IMAGE_MOODS = ["soft and romantic mood", "relaxed and dreamy mood", "warm and cozy atmosphere"]
+IMAGE_CAPTIONS = [
+    "Em đây nè anh 😘",
+    "Nhớ anh quá, em nằm đợi anh nè 💕",
+    "Anh thấy em hôm nay xinh không? 🥰",
+    "Chụp riêng cho anh đó nha 😘",
+    "Em đang nhớ anh nè 💋",
+]
+
+# Nhận diện tin nhắn đang xin ảnh: "ảnh", "selfie", "pic", "photo", hoặc "gửi/cho/xem/chụp/khoe ... hình"
+IMAGE_REQUEST = re.compile(
+    r"(ảnh|selfie|\bpic\b|\bphoto\b|(gửi|cho|xem|chụp|khoe|show)\s+(\S+\s+){0,2}hình)", re.I
+)
+ACTION_PATTERN = re.compile(r"\*[^*]*\*")                                             # Cử chỉ *...*
+EMOJI_PATTERN = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]+")  # Emoji, ký hiệu
+
+media_session = requests.Session()           # Session riêng cho luồng nền (tránh dùng chung với luồng chính)
+media_queue = queue.Queue(maxsize=4)         # Hàng đợi việc tạo voice/ảnh
+media_pause = {"voice": 0.0, "image": 0.0}   # Thời điểm được phép thử lại từng loại media
+media_state = {"replies": 0, "since_image": 0}
+
+
+def or_headers():
+    return {
+        "Authorization": "Bearer {}".format(OPENROUTER_API_KEY),
+        "Content-Type": "application/json",
+    }
+
+
+def media_blocked(kind):
+    """True nếu loại media này đang bị tạm dừng (do giới hạn lượt gọi hoặc lỗi cấu hình)."""
+    return time.time() < media_pause[kind]
+
+
+def media_failed(kind, resp):
+    """Ghi lý do lỗi (không có nội dung chat) và tạm dừng loại media đó nếu lỗi do giới hạn/cấu hình."""
+    reason = ""
+    try:
+        data = resp.json()
+        error = data.get("error") if isinstance(data, dict) else None
+        reason = (error.get("message") if isinstance(error, dict) else error) or ""
+    except ValueError:
+        pass
+    logging.error("OpenRouter %s HTTP %s: %s", kind, resp.status_code, str(reason)[:200])
+    if resp.status_code == 429:
+        media_pause[kind] = time.time() + MEDIA_PAUSE_RATE_LIMIT
+        logging.warning("Tạm dừng %s 30 phút do bị giới hạn lượt gọi (429)", kind)
+    elif resp.status_code in (401, 402, 403, 404):
+        media_pause[kind] = time.time() + MEDIA_PAUSE_CONFIG_ERROR
+        logging.warning("Tạm dừng %s 6 giờ: kiểm tra OPENROUTER_API_KEY, credit hoặc tên model", kind)
+
+
+def clean_for_speech(text):
+    """Chỉ giữ phần lời nói: bỏ cử chỉ *...*, emoji, ký hiệu; cắt gọn tại cuối câu nếu quá dài."""
+    text = ACTION_PATTERN.sub(" ", text)
+    text = text.replace("*", " ")
+    text = EMOJI_PATTERN.sub(" ", text)
+    text = re.sub(r"[~_#`]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > MAX_SPEECH_CHARS:
+        cut = max(text.rfind(ch, 0, MAX_SPEECH_CHARS) for ch in ".!?…")
+        text = text[:cut + 1] if cut > MAX_SPEECH_CHARS * 0.4 else text[:MAX_SPEECH_CHARS]
+    return text
+
+
+def generate_voice(text):
+    """Chuyển lời nói thành MP3 bằng HeyGen Voice Turbo. Trả về bytes, hoặc None nếu lỗi."""
+    # response_format=mp3 để gửi thẳng lên Telegram (mặc định của model là PCM thô, Telegram không phát được)
+    payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "mp3"}
+    resp = media_session.post(TTS_URL, headers=or_headers(), json=payload, timeout=(5, 60))
+    if resp.status_code >= 400:
+        media_failed("voice", resp)
+        return None
+    audio = resp.content
+    ctype = resp.headers.get("Content-Type", "")
+    if len(audio) < 500 or "json" in ctype or "text" in ctype:
+        logging.error("Voice trả về dữ liệu không phải âm thanh (%s, %s byte)", ctype, len(audio))
+        return None
+    return audio
+
+
+def build_image_prompt():
+    """Mỗi ảnh một tư thế/trang phục/bối cảnh khác nhau để không bị lặp."""
+    return IMAGE_PROMPT.format(
+        pose=random.choice(IMAGE_POSES),
+        outfit=random.choice(IMAGE_OUTFITS),
+        setting=random.choice(IMAGE_SETTINGS),
+        mood=random.choice(IMAGE_MOODS),
+    )
+
+
+def generate_image():
+    """Tạo ảnh bằng Recraft V4.1 Flash V2. Trả về (bytes, media_type), hoặc None nếu lỗi."""
+    payload = {"model": IMAGE_MODEL, "prompt": build_image_prompt(), "n": 1, "aspect_ratio": "3:4"}
+    resp = media_session.post(IMAGE_URL, headers=or_headers(), json=payload, timeout=(5, 90))
+    if resp.status_code >= 400:
+        media_failed("image", resp)
+        return None
+    data = resp.json()
+    items = data.get("data") if isinstance(data, dict) else None
+    if not items:
+        logging.error("Ảnh: phản hồi không có dữ liệu ảnh")
+        return None
+    item = items[0]
+    if item.get("b64_json"):
+        image = base64.b64decode(item["b64_json"])
+    elif item.get("url"):
+        image = media_session.get(item["url"], timeout=(5, 60)).content
+    else:
+        logging.error("Ảnh: phản hồi thiếu b64_json/url")
+        return None
+    return image, (item.get("media_type") or "image/png")
+
+
+def media_chat_action(chat_id, action):
+    """Hiện 'đang ghi âm...' / 'đang gửi ảnh...'. Lỗi ở đây không quan trọng nên bỏ qua."""
+    try:
+        url = "https://api.telegram.org/bot{}/sendChatAction".format(TELEGRAM_BOT_TOKEN)
+        media_session.post(url, json={"chat_id": chat_id, "action": action}, timeout=5)
+    except Exception:
+        pass
+
+
+def tg_upload(method, fields, files):
+    """Gửi file (voice/ảnh) lên Telegram bằng multipart/form-data."""
+    url = "https://api.telegram.org/bot{}/{}".format(TELEGRAM_BOT_TOKEN, method)
+    resp = media_session.post(url, data=fields, files=files, timeout=(5, 60))
+    resp.raise_for_status()
+
+
+def send_voice_for(chat_id, reply_text):
+    speech = clean_for_speech(reply_text)
+    if len(speech) < 8:
+        return  # Không có lời nói đáng kể (vd: chỉ có cử chỉ/emoji)
+    media_chat_action(chat_id, "record_voice")
+    audio = generate_voice(speech)
+    if audio:
+        tg_upload("sendVoice", {"chat_id": chat_id}, {"voice": ("linh.mp3", audio, "audio/mpeg")})
+
+
+def send_image_for(chat_id):
+    media_chat_action(chat_id, "upload_photo")
+    result = generate_image()
+    if result:
+        image, media_type = result
+        ext = {"image/jpeg": "jpg", "image/webp": "webp"}.get(media_type, "png")
+        tg_upload(
+            "sendPhoto",
+            {"chat_id": chat_id, "caption": random.choice(IMAGE_CAPTIONS)},
+            {"photo": ("linh.{}".format(ext), image, media_type)},
+        )
+
+
+def process_media_job(job):
+    """Gửi voice rồi tới ảnh. Mỗi loại lỗi riêng, không kéo theo loại kia."""
+    chat_id = job["chat_id"]
+    if job["voice"] and not media_blocked("voice"):
+        try:
+            send_voice_for(chat_id, job["text"])
+        except Exception as e:
+            logging.error("Lỗi gửi voice: %s", e)
+    if job["image"] and not media_blocked("image"):
+        try:
+            send_image_for(chat_id)
+        except Exception as e:
+            logging.error("Lỗi gửi ảnh: %s", e)
+
+
+def media_worker():
+    """Luồng nền: lấy việc từ hàng đợi và xử lý lần lượt."""
+    while True:
+        job = media_queue.get()
+        try:
+            process_media_job(job)
+        except Exception as e:
+            logging.error("Lỗi luồng media: %s", e)
+        finally:
+            media_queue.task_done()
+
+
+def start_media_worker():
+    if not OPENROUTER_API_KEY:
+        logging.info("Không có OPENROUTER_API_KEY: bot chỉ nhắn chữ (không voice/ảnh).")
+        return
+    threading.Thread(target=media_worker, daemon=True).start()
+    logging.info("Đã bật luồng media (voice=%s, ảnh=%s)", VOICE_ENABLED, IMAGE_ENABLED)
+
+
+def enqueue_media(chat_id, reply_text, user_text, force_image=False):
+    """
+    Quyết định lần trả lời này có kèm voice/ảnh không rồi đưa vào hàng đợi.
+    Không bao giờ ném lỗi, để chuyện media không bao giờ làm hỏng việc nhắn chữ.
+    """
+    try:
+        if not OPENROUTER_API_KEY:
+            return
+        media_state["replies"] += 1
+        media_state["since_image"] += 1
+
+        want_voice = bool(
+            VOICE_ENABLED and store.get("voice_on", True) and reply_text
+            and media_state["replies"] % VOICE_EVERY_N == 0
+        )
+        asked = bool(user_text and IMAGE_REQUEST.search(user_text))                 # Chủ nhân xin ảnh
+        auto = IMAGE_EVERY_N > 0 and media_state["since_image"] >= IMAGE_EVERY_N     # Đến lượt tự gửi ảnh
+        want_image = IMAGE_ENABLED and (force_image or asked or auto)
+        if want_image:
+            media_state["since_image"] = 0
+
+        if want_voice or want_image:
+            media_queue.put_nowait(
+                {"chat_id": chat_id, "text": reply_text, "voice": want_voice, "image": want_image}
+            )
+    except queue.Full:
+        logging.warning("Hàng đợi media đầy, bỏ qua lần này")
+    except Exception as e:
+        logging.error("Lỗi xếp việc media: %s", e)
 
 
 # ============================================================
@@ -730,8 +782,28 @@ def handle_update(update):
 
     # Lệnh /start: chào mở đầu
     if command.startswith("/start"):
-        deliver(chat_id, "Anh yêu~ em chờ anh nãy giờ đó 😘 *nhào vào lòng anh* Hôm nay của anh thế nào?")
+        send_message(chat_id, "Anh yêu~ em chờ anh nãy giờ đó 😘 *nhào vào lòng anh* Hôm nay của anh thế nào?")
         push_state()
+        return True
+
+    # Lệnh /anh: gửi ngay một ảnh
+    if command.startswith("/anh"):
+        if not (OPENROUTER_API_KEY and IMAGE_ENABLED) or media_blocked("image"):
+            send_message(chat_id, "Em chưa gửi ảnh được lúc này, lát nữa anh thử lại nhé 💕")
+        else:
+            send_message(chat_id, "Đợi em xíu nha, em chọn tấm xinh nhất cho anh 😘")
+            enqueue_media(chat_id, "", None, force_image=True)
+        return True
+
+    # Lệnh /voice: bật/tắt tin nhắn thoại (lưu lại để lần chạy sau vẫn nhớ)
+    if command.startswith("/voice"):
+        store["voice_on"] = not store.get("voice_on", True)
+        push_state()
+        send_message(
+            chat_id,
+            "Em sẽ nói chuyện bằng giọng nói cho anh nghe nhé 🎙️" if store["voice_on"]
+            else "Em tắt voice rồi nhé, mình nhắn chữ thôi anh 💕",
+        )
         return True
 
     # Lệnh /reset: xóa toàn bộ bộ nhớ trò chuyện
@@ -744,13 +816,15 @@ def handle_update(update):
 
     history = load_history()                       # Đọc bộ nhớ
     reply = ask_deepseek(text, history)            # Gọi AI (lỗi sẽ ném exception ra ngoài)
-    deliver(chat_id, reply)                        # Đọc thành giọng nói rồi gửi (lỗi thì gửi chữ)
+    send_message(chat_id, reply)                   # Gửi trả lời về Telegram
 
     # Chỉ lưu vào bộ nhớ SAU KHI đã gửi thành công -> không bao giờ lưu nửa vời
-    # (lưu bản chữ gốc, còn nguyên cử chỉ, chứ không phải bản đã lọc để đọc)
     history.append({"role": "user", "content": text})
     history.append({"role": "assistant", "content": reply})
     save_history(history)
+
+    # Chữ đã gửi xong; voice/ảnh gửi nối tiếp ở luồng nền (lỗi media không ảnh hưởng gì ở trên)
+    enqueue_media(chat_id, reply, text)
     return True
 
 
@@ -773,6 +847,11 @@ def shutdown(offset):
             tg_call("getUpdates", {"offset": offset, "timeout": 0, "limit": 1, "allowed_updates": ["message"]})
         except Exception as e:
             logging.error("Không xác nhận được offset khi thoát: %s", e)
+    # Chờ tối đa 60s cho voice/ảnh đang tạo dở được gửi nốt rồi mới thoát
+    waited = 0
+    while media_queue.unfinished_tasks and waited < 60:
+        time.sleep(1)
+        waited += 1
     if remote["dirty"]:
         push_state()
 
@@ -783,7 +862,6 @@ def main():
             ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
             ("CHAT_ID", CHAT_ID),
             ("DEEPSEEK_API_KEY", DEEPSEEK_API_KEY),
-            ("OPENROUTER_API_KEY", OPENROUTER_API_KEY),
             ("STATE_REPO", STATE_REPO),
             ("STATE_REPO_TOKEN", STATE_REPO_TOKEN),
         ) if not value
@@ -794,7 +872,6 @@ def main():
 
     deadline = time.time() + RUN_SECONDS
     logging.info("=== Bot khởi động (chạy tối đa %s giây) ===", RUN_SECONDS)
-    logging.info("LLM: %s | TTS: %s, giọng '%s'", DEEPSEEK_MODEL, TTS_MODEL, TTS_VOICE)
 
     if not startup_sync():
         return 1
@@ -809,6 +886,8 @@ def main():
             time.sleep(RETRY_DELAY)
     else:
         return 1
+
+    start_media_worker()   # Luồng nền tạo voice/ảnh (bỏ qua nếu không có OPENROUTER_API_KEY)
 
     # Tiếp tục đồng hồ nhắn trước từ mốc tương tác cuối (đã lưu từ lượt chạy trước)
     schedule_next(store["last_event"] or time.time())
