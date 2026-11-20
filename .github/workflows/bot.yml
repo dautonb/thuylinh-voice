@@ -1,4 +1,4 @@
-name: Linh Voice Bot
+name: Linh Bot
 
 on:
   # Chạy thủ công lần đầu, và để mỗi lượt tự kích hoạt lượt kế tiếp
@@ -11,7 +11,7 @@ on:
 # Chỉ cho phép 1 lượt chạy cùng lúc. Lượt mới xếp hàng chờ, KHÔNG hủy lượt đang chạy,
 # nhờ vậy 2 bot không bao giờ tranh nhau getUpdates (lỗi 409).
 concurrency:
-  group: linh-voice-bot
+  group: linh-bot
   cancel-in-progress: false
 
 permissions:
@@ -28,21 +28,19 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       CHAT_ID: ${{ secrets.CHAT_ID }}
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # Khóa OpenRouter để tạo giọng nói HeyGen
       STATE_REPO: ${{ secrets.STATE_REPO }}
       STATE_REPO_TOKEN: ${{ secrets.STATE_REPO_TOKEN }}
+      STATE_FILE: ${{ secrets.STATE_FILE }}   # Tùy chọn: để trống thì dùng state.json
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}   # Cho ảnh + voice (không có thì bot chỉ nhắn chữ)
+      # Cấu hình voice/ảnh: sửa trực tiếp các dòng dưới rồi commit
+      IMAGE_MODEL: "recraft/recraft-v4.1-flash-v2:free"
+      TTS_MODEL: "heygen/heygen-voice-1-turbo:free"   # Bản free ngừng 30/11/2026 -> đổi thành heygen/heygen-voice-1-turbo (trả phí)
+      TTS_VOICE: "nadine"
+      VOICE_EVERY_N: "1"    # Cứ N tin trả lời thì kèm 1 voice
+      IMAGE_EVERY_N: "6"    # Cứ N tin trả lời tự gửi 1 ảnh (0 = chỉ gửi khi được xin)
       SYSTEM_PROMPT: ${{ secrets.SYSTEM_PROMPT }}
       STYLE_REMINDER: ${{ secrets.STYLE_REMINDER }}
       PROACTIVE_INSTRUCTION: ${{ secrets.PROACTIVE_INSTRUCTION }}
-      # --- Cấu hình giọng nói (không nhạy cảm nên để thẳng ở đây) ---
-      DEEPSEEK_MODEL: "deepseek-v4-flash"
-      # Bản :free bị OpenRouter gỡ ngày 30/11/2026 -> sau ngày đó đổi thành "heygen/heygen-voice-1-turbo" (trả phí, cần nạp credit)
-      TTS_MODEL: "heygen/heygen-voice-1-turbo:free"
-      # Giọng: nadine, tabitha, bram, gareth, noelle, meredith, sabrina, lucian, weston, vincent
-      TTS_VOICE: "sabrina"
-      TTS_PCM_RATE: "44100"       # Tần số mẫu PCM của HeyGen. Nghe giọng nhanh/chậm/méo thì thử 24000 hoặc 22050
-      SEND_TEXT_ALSO: "0"         # "1" = gửi thêm bản chữ ngay sau mỗi tin voice
-      # STATE_FILE: "state_voice.json"   # Bỏ comment nếu muốn bản voice có bộ nhớ riêng, không dùng chung với bot cũ
       RUN_SECONDS: "20400"        # Bot tự thoát sau 5h40m để còn kịp nối lượt kế tiếp
       TZ_OFFSET_HOURS: "7"        # Múi giờ Việt Nam (UTC+7) để tính giờ yên lặng
       PYTHONUNBUFFERED: "1"       # In log ra ngay, không bị giữ đệm
@@ -60,11 +58,6 @@ jobs:
 
       - name: Cài thư viện
         run: pip install -r requirements.txt
-
-      # BẮT BUỘC: HeyGen Voice chỉ trả PCM thô, bot dùng ffmpeg đổi sang ogg/opus để Telegram phát được.
-      # Máy đã có sẵn ffmpeg thì bước này bỏ qua ngay.
-      - name: Cài ffmpeg
-        run: command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
 
       - name: Chạy bot
         id: bot
