@@ -69,16 +69,16 @@ GH_API = "https://api.github.com"
 STATE_FILE = env("STATE_FILE", "state.json")   # Tên file lưu bộ nhớ; 2 bot dùng chung repo dữ liệu thì mỗi bot một tên
 
 MEMORY_WINDOW = 14           # Số tin gần nhất gửi kèm làm ngữ cảnh mỗi lần gọi API
-MAX_STORED_MESSAGES = 60000     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
+MAX_STORED_MESSAGES = 60     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
 POLL_TIMEOUT = 20            # Long Polling: Telegram giữ kết nối tối đa 20s nếu chưa có tin mới
 RETRY_DELAY = 5              # Giây chờ khi lỗi mạng / lỗi API trước khi thử lại
 MAX_RETRY_PER_UPDATE = 3     # Một tin nhắn lỗi tối đa 3 lần thì bỏ qua
 
 # --- Tính năng Linh chủ động nhắn trước khi chủ nhân im lặng ---
 PROACTIVE_ENABLED = True
-PROACTIVE_MIN_IDLE = 1 * 3600
-PROACTIVE_MAX_IDLE = 1 * 4800
-MAX_UNANSWERED_PROACTIVE = 20000     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
+PROACTIVE_MIN_IDLE = 2 * 3600
+PROACTIVE_MAX_IDLE = 3 * 3600
+MAX_UNANSWERED_PROACTIVE = 2     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
 QUIET_START_HOUR = 0             # Không nhắn trước từ 0h...
 QUIET_END_HOUR = 7               # ...đến 7h sáng (theo TZ_OFFSET_HOURS)
 PROACTIVE_RETRY_DELAY = 60
@@ -104,7 +104,7 @@ VOICE_EVERY_N = max(1, env_int("VOICE_EVERY_N", 1))    # Cứ N tin trả lời 
 IMAGE_EVERY_N = max(0, env_int("IMAGE_EVERY_N", 6))    # Cứ N tin trả lời tự gửi 1 ảnh (0 = chỉ gửi khi được xin)
 MAX_SPEECH_CHARS = 600                                 # Giới hạn độ dài lời nói mỗi voice (tiết kiệm, nói nhanh)
 MEDIA_PAUSE_RATE_LIMIT = 30 * 60                       # Bị giới hạn lượt gọi (429): tạm dừng loại media đó 30 phút
-MEDIA_PAUSE_CONFIG_ERROR = 6 * 3600                    # Lỗi khóa/credit/tên model (401-404): tạm dừng 6 giờ
+MEDIA_PAUSE_CONFIG_ERROR = 3600                        # Lỗi khóa/credit/tên model (401-404): tạm dừng 1 giờ
 
 
 # ============================================================
@@ -552,6 +552,10 @@ media_session = requests.Session()           # Session riêng cho luồng nền 
 media_queue = queue.Queue(maxsize=4)         # Hàng đợi việc tạo voice/ảnh
 media_pause = {"voice": 0.0, "image": 0.0}   # Thời điểm được phép thử lại từng loại media
 media_state = {"replies": 0, "since_image": 0}
+media_info = {   # Dùng cho lệnh /media
+    "voice": {"last_ok": 0.0, "last_error": ""},
+    "image": {"last_ok": 0.0, "last_error": ""},
+}
 
 
 def or_headers():
@@ -566,6 +570,14 @@ def media_blocked(kind):
     return time.time() < media_pause[kind]
 
 
+def media_note_error(kind, message):
+    """Lưu lý do lỗi gần nhất của voice/ảnh để lệnh /media hiển thị (đã che khóa bí mật)."""
+    for secret in (TELEGRAM_BOT_TOKEN, DEEPSEEK_API_KEY, STATE_REPO_TOKEN, OPENROUTER_API_KEY):
+        if secret:
+            message = message.replace(secret, "***")
+    media_info[kind]["last_error"] = message[:160]
+
+
 def media_failed(kind, resp):
     """Ghi lý do lỗi (không có nội dung chat) và tạm dừng loại media đó nếu lỗi do giới hạn/cấu hình."""
     reason = ""
@@ -576,12 +588,13 @@ def media_failed(kind, resp):
     except ValueError:
         pass
     logging.error("OpenRouter %s HTTP %s: %s", kind, resp.status_code, str(reason)[:200])
+    media_note_error(kind, "HTTP {}: {}".format(resp.status_code, reason or "không rõ lý do"))
     if resp.status_code == 429:
         media_pause[kind] = time.time() + MEDIA_PAUSE_RATE_LIMIT
         logging.warning("Tạm dừng %s 30 phút do bị giới hạn lượt gọi (429)", kind)
     elif resp.status_code in (401, 402, 403, 404):
         media_pause[kind] = time.time() + MEDIA_PAUSE_CONFIG_ERROR
-        logging.warning("Tạm dừng %s 6 giờ: kiểm tra OPENROUTER_API_KEY, credit hoặc tên model", kind)
+        logging.warning("Tạm dừng %s 1 giờ: kiểm tra OPENROUTER_API_KEY, credit, cài đặt quyền riêng tư hoặc tên model", kind)
 
 
 def clean_for_speech(text):
@@ -609,6 +622,7 @@ def generate_voice(text):
     ctype = resp.headers.get("Content-Type", "")
     if len(audio) < 500 or "json" in ctype or "text" in ctype:
         logging.error("Voice trả về dữ liệu không phải âm thanh (%s, %s byte)", ctype, len(audio))
+        media_note_error("voice", "phản hồi không phải âm thanh ({}, {} byte)".format(ctype, len(audio)))
         return None
     return audio
 
@@ -634,6 +648,7 @@ def generate_image():
     items = data.get("data") if isinstance(data, dict) else None
     if not items:
         logging.error("Ảnh: phản hồi không có dữ liệu ảnh")
+        media_note_error("image", "phản hồi không có dữ liệu ảnh")
         return None
     item = items[0]
     if item.get("b64_json"):
@@ -642,6 +657,7 @@ def generate_image():
         image = media_session.get(item["url"], timeout=(5, 60)).content
     else:
         logging.error("Ảnh: phản hồi thiếu b64_json/url")
+        media_note_error("image", "phản hồi thiếu b64_json/url")
         return None
     return image, (item.get("media_type") or "image/png")
 
@@ -670,6 +686,8 @@ def send_voice_for(chat_id, reply_text):
     audio = generate_voice(speech)
     if audio:
         tg_upload("sendVoice", {"chat_id": chat_id}, {"voice": ("linh.mp3", audio, "audio/mpeg")})
+        media_info["voice"]["last_ok"] = time.time()
+        logging.info("Đã gửi voice")
 
 
 def send_image_for(chat_id):
@@ -683,6 +701,8 @@ def send_image_for(chat_id):
             {"chat_id": chat_id, "caption": random.choice(IMAGE_CAPTIONS)},
             {"photo": ("linh.{}".format(ext), image, media_type)},
         )
+        media_info["image"]["last_ok"] = time.time()
+        logging.info("Đã gửi ảnh")
 
 
 def process_media_job(job):
@@ -693,11 +713,13 @@ def process_media_job(job):
             send_voice_for(chat_id, job["text"])
         except Exception as e:
             logging.error("Lỗi gửi voice: %s", e)
+            media_note_error("voice", str(e))
     if job["image"] and not media_blocked("image"):
         try:
             send_image_for(chat_id)
         except Exception as e:
             logging.error("Lỗi gửi ảnh: %s", e)
+            media_note_error("image", str(e))
 
 
 def media_worker():
@@ -718,6 +740,39 @@ def start_media_worker():
         return
     threading.Thread(target=media_worker, daemon=True).start()
     logging.info("Đã bật luồng media (voice=%s, ảnh=%s)", VOICE_ENABLED, IMAGE_ENABLED)
+
+
+def fmt_duration(seconds):
+    seconds = int(max(0, seconds))
+    if seconds >= 3600:
+        return "{} giờ {} phút".format(seconds // 3600, (seconds % 3600) // 60)
+    if seconds >= 60:
+        return "{} phút".format(seconds // 60)
+    return "{} giây".format(seconds)
+
+
+def media_status_text():
+    """Báo cáo trạng thái voice/ảnh để bạn biết ngay vì sao chưa gửi được (lệnh /media)."""
+    lines = ["Trạng thái voice/ảnh:"]
+    lines.append("• OPENROUTER_API_KEY: {}".format(
+        "có" if OPENROUTER_API_KEY else "CHƯA CÓ (kiểm tra secret và file bot.yml)"))
+    for kind, label, enabled in (
+        ("voice", "Voice", VOICE_ENABLED and store.get("voice_on", True)),
+        ("image", "Ảnh", IMAGE_ENABLED),
+    ):
+        info = media_info[kind]
+        parts = ["bật" if enabled else "tắt"]
+        if media_blocked(kind):
+            parts.append("đang tạm dừng {}".format(fmt_duration(media_pause[kind] - time.time())))
+        if info["last_ok"]:
+            parts.append("gửi gần nhất {} trước".format(fmt_duration(time.time() - info["last_ok"])))
+        else:
+            parts.append("chưa gửi được lần nào")
+        if info["last_error"]:
+            parts.append("lỗi gần nhất: {}".format(info["last_error"]))
+        lines.append("• {}: {}".format(label, "; ".join(parts)))
+    lines.append('Gõ "/media test" để thử gửi ngay một voice và một ảnh.')
+    return "\n".join(lines)
 
 
 def enqueue_media(chat_id, reply_text, user_text, force_image=False):
@@ -784,6 +839,24 @@ def handle_update(update):
     if command.startswith("/start"):
         send_message(chat_id, "Anh yêu~ em chờ anh nãy giờ đó 😘 *nhào vào lòng anh* Hôm nay của anh thế nào?")
         push_state()
+        return True
+
+    # Lệnh /media: xem trạng thái voice/ảnh. "/media test": bỏ tạm dừng và thử gửi ngay 1 voice + 1 ảnh
+    if command.startswith("/media"):
+        if "test" in command and OPENROUTER_API_KEY:
+            media_pause["voice"] = media_pause["image"] = 0.0
+            try:
+                media_queue.put_nowait({
+                    "chat_id": chat_id,
+                    "text": "Anh ơi, em đang thử giọng nói cho anh nghe nè, anh nghe rõ không?",
+                    "voice": VOICE_ENABLED,
+                    "image": IMAGE_ENABLED,
+                })
+                send_message(chat_id, "Em đang thử gửi voice và ảnh, anh đợi một chút rồi gõ /media để xem kết quả nhé.")
+            except queue.Full:
+                send_message(chat_id, "Em đang bận gửi dở, anh thử lại sau nhé.")
+        else:
+            send_message(chat_id, media_status_text())
         return True
 
     # Lệnh /anh: gửi ngay một ảnh
