@@ -18,7 +18,9 @@ import os
 import queue
 import random
 import re
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -69,16 +71,16 @@ GH_API = "https://api.github.com"
 STATE_FILE = env("STATE_FILE", "state.json")   # Tên file lưu bộ nhớ; 2 bot dùng chung repo dữ liệu thì mỗi bot một tên
 
 MEMORY_WINDOW = 14           # Số tin gần nhất gửi kèm làm ngữ cảnh mỗi lần gọi API
-MAX_STORED_MESSAGES = 60000     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
+MAX_STORED_MESSAGES = 60     # Chỉ cần lưu hơn 14 tin một chút -> mỗi lần lưu rất nhẹ
 POLL_TIMEOUT = 20            # Long Polling: Telegram giữ kết nối tối đa 20s nếu chưa có tin mới
 RETRY_DELAY = 5              # Giây chờ khi lỗi mạng / lỗi API trước khi thử lại
 MAX_RETRY_PER_UPDATE = 3     # Một tin nhắn lỗi tối đa 3 lần thì bỏ qua
 
 # --- Tính năng Linh chủ động nhắn trước khi chủ nhân im lặng ---
 PROACTIVE_ENABLED = True
-PROACTIVE_MIN_IDLE = 1 * 3600
-PROACTIVE_MAX_IDLE = 1 * 3600
-MAX_UNANSWERED_PROACTIVE = 20000     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
+PROACTIVE_MIN_IDLE = 2 * 3600
+PROACTIVE_MAX_IDLE = 3 * 3600
+MAX_UNANSWERED_PROACTIVE = 2     # Nhắn trước tối đa 2 tin liên tiếp nếu chưa được trả lời
 QUIET_START_HOUR = 0             # Không nhắn trước từ 0h...
 QUIET_END_HOUR = 7               # ...đến 7h sáng (theo TZ_OFFSET_HOURS)
 PROACTIVE_RETRY_DELAY = 60
@@ -98,6 +100,7 @@ TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 IMAGE_MODEL = env("IMAGE_MODEL", "recraft/recraft-v4.1-flash-v2:free")
 TTS_MODEL = env("TTS_MODEL", "heygen/heygen-voice-1-turbo:free")   # Bản free ngừng ngày 30/11/2026
 TTS_VOICE = env("TTS_VOICE", "nadine")
+TTS_SAMPLE_RATE = env_int("TTS_SAMPLE_RATE", 44100)   # HeyGen Voice Turbo trả PCM 44.1 kHz, mono, 16-bit
 IMAGE_ENABLED = env("IMAGE_ENABLED", "1") != "0"
 VOICE_ENABLED = env("VOICE_ENABLED", "1") != "0"
 VOICE_EVERY_N = max(1, env_int("VOICE_EVERY_N", 1))    # Cứ N tin trả lời thì kèm 1 voice
@@ -610,21 +613,76 @@ def clean_for_speech(text):
     return text
 
 
+# HeyGen Voice Turbo CHỈ trả PCM thô (44.1 kHz, mono, 16-bit little-endian), còn Telegram chỉ phát được
+# OGG/Opus, MP3 hoặc M4A -> phải chuyển PCM sang MP3 trước khi gửi.
+def audio_encoder():
+    """Trả về "lameenc" (thư viện pip), "ffmpeg" (chương trình ngoài), hoặc None nếu không có cái nào."""
+    try:
+        import lameenc  # noqa: F401
+        return "lameenc"
+    except ImportError:
+        pass
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    return None
+
+
+def pcm_to_mp3(pcm):
+    """Chuyển PCM thô (16-bit little-endian, mono, TTS_SAMPLE_RATE Hz) sang MP3 để Telegram phát được."""
+    if len(pcm) % 2:
+        pcm = pcm[:-1]   # Mẫu 16-bit phải có số byte chẵn
+    encoder = audio_encoder()
+    if encoder == "lameenc":
+        import lameenc
+        enc = lameenc.Encoder()
+        enc.set_bit_rate(64)                    # 64 kbps là đủ rõ cho giọng nói
+        enc.set_in_sample_rate(TTS_SAMPLE_RATE)
+        enc.set_channels(1)
+        enc.set_quality(2)                      # 2 = chất lượng cao
+        return bytes(enc.encode(pcm)) + bytes(enc.flush())
+    if encoder == "ffmpeg":
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "s16le", "-ar", str(TTS_SAMPLE_RATE), "-ac", "1", "-i", "pipe:0",
+             "-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3", "pipe:1"],
+            input=pcm, capture_output=True, timeout=30,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError("ffmpeg lỗi: {}".format(proc.stderr.decode("utf-8", "ignore")[:150]))
+        return proc.stdout
+    raise RuntimeError("Thiếu bộ chuyển âm thanh (cần lameenc hoặc ffmpeg)")
+
+
 def generate_voice(text):
-    """Chuyển lời nói thành MP3 bằng HeyGen Voice Turbo. Trả về bytes, hoặc None nếu lỗi."""
-    # response_format=mp3 để gửi thẳng lên Telegram (mặc định của model là PCM thô, Telegram không phát được)
-    payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "mp3"}
+    """Chuyển lời nói thành MP3 bằng HeyGen Voice Turbo (nhận PCM rồi đổi sang MP3). Trả về bytes, hoặc None nếu lỗi."""
+    if audio_encoder() is None:
+        # Không có bộ chuyển thì đừng gọi API (tốn lượt miễn phí mà vô ích)
+        logging.error("Voice: thiếu lameenc/ffmpeg để chuyển PCM sang MP3")
+        media_note_error("voice", "thiếu bộ chuyển âm thanh (cần lameenc hoặc ffmpeg)")
+        return None
+
+    # Model này chỉ hỗ trợ response_format = "pcm" (gửi "mp3" sẽ bị lỗi HTTP 400)
+    payload = {"model": TTS_MODEL, "input": text, "voice": TTS_VOICE, "response_format": "pcm"}
     resp = media_session.post(TTS_URL, headers=or_headers(), json=payload, timeout=(5, 60))
     if resp.status_code >= 400:
         media_failed("voice", resp)
         return None
+
     audio = resp.content
     ctype = resp.headers.get("Content-Type", "")
     if len(audio) < 500 or "json" in ctype or "text" in ctype:
         logging.error("Voice trả về dữ liệu không phải âm thanh (%s, %s byte)", ctype, len(audio))
         media_note_error("voice", "phản hồi không phải âm thanh ({}, {} byte)".format(ctype, len(audio)))
         return None
-    return audio
+    if "mpeg" in ctype or "mp3" in ctype:
+        return audio   # Phòng khi nhà cung cấp đổi sang trả MP3 sẵn
+
+    seconds = len(audio) / float(TTS_SAMPLE_RATE * 2)
+    if seconds < 0.3:
+        logging.error("Voice: âm thanh quá ngắn (%.2f giây)", seconds)
+        media_note_error("voice", "âm thanh quá ngắn ({:.2f} giây)".format(seconds))
+        return None
+    return pcm_to_mp3(audio)
 
 
 def build_image_prompt():
@@ -739,7 +797,7 @@ def start_media_worker():
         logging.info("Không có OPENROUTER_API_KEY: bot chỉ nhắn chữ (không voice/ảnh).")
         return
     threading.Thread(target=media_worker, daemon=True).start()
-    logging.info("Đã bật luồng media (voice=%s, ảnh=%s)", VOICE_ENABLED, IMAGE_ENABLED)
+    logging.info("Đã bật luồng media (voice=%s, ảnh=%s, bộ chuyển âm thanh=%s)", VOICE_ENABLED, IMAGE_ENABLED, audio_encoder())
 
 
 def fmt_duration(seconds):
@@ -756,6 +814,7 @@ def media_status_text():
     lines = ["Trạng thái voice/ảnh:"]
     lines.append("• OPENROUTER_API_KEY: {}".format(
         "có" if OPENROUTER_API_KEY else "CHƯA CÓ (kiểm tra secret và file bot.yml)"))
+    lines.append("• Bộ chuyển PCM sang MP3: {}".format(audio_encoder() or "CHƯA CÓ (cần lameenc hoặc ffmpeg)"))
     for kind, label, enabled in (
         ("voice", "Voice", VOICE_ENABLED and store.get("voice_on", True)),
         ("image", "Ảnh", IMAGE_ENABLED),
